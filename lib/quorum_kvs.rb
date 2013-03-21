@@ -22,7 +22,7 @@ module QuorumKVS
 
     table :current_request, buffer.schema
     table :waiting, buffer.schema
-    table :get_count, [:reqid, :time, :key, :value]
+    table :get_count, [:reqid, :time, :key, :oldtime, :value]
     table :put_count, [:reqid, :time]
 
     scratch :cur_put, kvput.schema
@@ -38,21 +38,22 @@ module QuorumKVS
   end
 
   bloom :buffering do
-  	buffer <= kvput {|p| [budtime, [p]]}
-  	buffer <= kvget {|g| [budtime, [g]]}
-    current_request <= buffer.argmin([], :reqid) do |b|
-    	b if not waiting.exists?
-    end
+  	buffer <= kvput {|p| [p.reqid, [p]]}
+  	buffer <= kvget {|g| [g.reqid, [g]]}
+    current_request <= buffer.argmin([], :reqid)
+    #current_request <= buffer.argmin([], :reqid) do |b|
+    #	b if waiting.to_a.length == 0
+    #end
     buffer <- current_request
   end
 
   
   # requests are re-routed to "chosen" destination(s)
   bloom :requests do
-  	cur_put <= current_request{|c| c.request if c.request.to_a.length == 4}
+  	cur_put <= current_request{|c| c.request.to_a[0].to_a if c.request.to_a[0].to_a.length == 4}
     cur_put2 <= cur_put{|c| [c.to_a[0], c.to_a[1], c.to_a[2], [time.reveal, c.to_a[3]]]} #makes the value stored [budtime, value] for most recent comparisons
-  	cur_get <= current_request{|c| c.request if c.request.to_a.length == 2}
-  	waiting <+ current_request
+  	cur_get <= current_request{|c| c.request.to_a[0].to_a if c.request.to_a[0].to_a.length == 2}
+  	waiting <= current_request
   	current_request <- current_request
     kvput_chan <~ (member * cur_put2).pairs{|m,k| [m.host, ip_port, time.reveal] + k.to_a}
     kvget_chan <~ (member * cur_get).pairs{|m,k| [m.host, ip_port, time.reveal] + k.to_a}
@@ -70,27 +71,29 @@ module QuorumKVS
 
   # forward responses to the original requestor node
   bloom :responses do
-    get_count <= (kvget_response_chan * waiting).lefts(:reqid => :reqid){|k,w| [k.to_a[2],k.to_a[1],k.to_a[3],k.to_a[4]]}
+
+    get_count <= (kvget_response_chan * waiting).lefts(:reqid => :reqid){|k,w| [k.to_a[2],k.to_a[1],k.to_a[3],k.to_a[4][0],k.to_a[4][1]]}
     put_count <= (kv_acks_chan * waiting).lefts(:reqid => :reqid) {|k, w| [k.reqid, k.t] }
     kv_acks <= put_count.argmax([], :time) do |c|
-      [c.reqid] if put_count.to_a.lenth >= (member.to_a.length * r_w.to_a[0][1])
+      [c.reqid] if put_count.to_a.length >= (member.to_a.length * r_w.to_a[0][1])
     end
-    kvget_response <= get_count.argmax([], :time) do |c|
-      [c.reqid, c.key, c.value] if get_count.to_a.lenth >= (member.to_a.length * r_w.to_a[0][0])
+    kvget_response <= get_count.argmax([], :oldtime) do |c|
+      [c.reqid, c.key, c.value] if get_count.to_a.length >= (member.to_a.length * r_w.to_a[0][0])
     end
+    #stdio <~ [[kv_acks.to_a.length]]
     waiting <- waiting do |w|
-      w if kv_acks.to_a.length > 0 or kv_get_response.to_a.length > 0
+      w if kv_acks.to_a.length > 0 or kvget_response.to_a.length > 0
     end
     get_count <- get_count do |g|
-      g if kv_acks.to_a.length > 0 or kv_get_response.to_a.length > 0
+      g if kv_acks.to_a.length > 0 or kvget_response.to_a.length > 0
     end
     put_count <- put_count do |p|
-      p if kv_acks.to_a.length > 0 or kv_get_response.to_a.length > 0
+      p if kv_acks.to_a.length > 0 or kvget_response.to_a.length > 0
     end
   end
 
   bloom :timing do
-    time <= 1 #always at least time 1 to counter it starting at -inf
+    time <= [1] #always at least time 1 to counter it starting at -inf
     time <+ (time+1)
     time <= kvget_response_chan{|k| k.to_a[1]} #pushes the time of all of the gets to the clock
     time <= kvput_chan{|k| k.to_a[2]}
@@ -99,8 +102,9 @@ module QuorumKVS
   end
 
   bloom :testing do
-    stdio <~ cur_put.inspected
+    #stdio <~ waiting.inspected
     #stdio <~ kv_acks_chan.inspected
+    stdio <~ get_count.inspected
   end
 
 end
