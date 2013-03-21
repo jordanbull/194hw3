@@ -35,10 +35,6 @@ module QuorumKVS
   bloom :config do
   	# sets the quorum_configs if they aren't already set
   	r_w <= quorum_config
-  	r_w do |rw|
-  		@@r_num = rw.r_fraction
-  		@@w_num = rw.w_fraction
-  	end
   end
 
   bloom :buffering do
@@ -53,13 +49,13 @@ module QuorumKVS
   
   # requests are re-routed to "chosen" destination(s)
   bloom :requests do
-  	cur_put <= current_request{|c| c.requests if c.requests.to_a.length == 4}
+  	cur_put <= current_request{|c| c.request if c.request.to_a.length == 4}
     cur_put2 <= cur_put{|c| [c.to_a[0], c.to_a[1], c.to_a[2], [time.reveal, c.to_a[3]]]} #makes the value stored [budtime, value] for most recent comparisons
-  	cur_get <= current_request{|c| c.requests if c.requests.to_a.length == 2}
-  	waiting <= current_request
+  	cur_get <= current_request{|c| c.request if c.request.to_a.length == 2}
+  	waiting <+ current_request
   	current_request <- current_request
-    kvput_chan <~ (members * cur_put2).pairs{|m,k| [m.host, ip_port, time.reveal] + k.to_a}
-    kvget_chan <~ (members * cur_get).pairs{|m,k| [m.host, ip_port, time.reveal] + k.to_a}
+    kvput_chan <~ (member * cur_put2).pairs{|m,k| [m.host, ip_port, time.reveal] + k.to_a}
+    kvget_chan <~ (member * cur_get).pairs{|m,k| [m.host, ip_port, time.reveal] + k.to_a}
   end
 
   # receiver-side logic for re-routed requests
@@ -77,10 +73,10 @@ module QuorumKVS
     get_count <= (kvget_response_chan * waiting).lefts(:reqid => :reqid){|k,w| [k.to_a[2],k.to_a[1],k.to_a[3],k.to_a[4]]}
     put_count <= (kv_acks_chan * waiting).lefts(:reqid => :reqid) {|k, w| [k.reqid, k.t] }
     kv_acks <= put_count.argmax([], :time) do |c|
-      [c.reqid] if put_count.to_a.lenth >= (member.to_a.length * w_num)
+      [c.reqid] if put_count.to_a.lenth >= (member.to_a.length * r_w.to_a[0][1])
     end
-    kv_get_response <= get_count.argmax([], :time) do |c|
-      [c.reqid, c.key, c.value] if get_count.to_a.lenth >= (member.to_a.length * r_num)
+    kvget_response <= get_count.argmax([], :time) do |c|
+      [c.reqid, c.key, c.value] if get_count.to_a.lenth >= (member.to_a.length * r_w.to_a[0][0])
     end
     waiting <- waiting do |w|
       w if kv_acks.to_a.length > 0 or kv_get_response.to_a.length > 0
@@ -100,6 +96,11 @@ module QuorumKVS
     time <= kvput_chan{|k| k.to_a[2]}
     time <= kvget_chan{|k| k.to_a[2]}
     time <= kv_acks_chan{|k| k.to_a[2]}
+  end
+
+  bloom :testing do
+    stdio <~ cur_put.inspected
+    #stdio <~ kv_acks_chan.inspected
   end
 
 end
